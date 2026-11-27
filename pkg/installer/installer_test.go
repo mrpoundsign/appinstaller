@@ -1,12 +1,18 @@
 package installer
 
 import (
+	"archive/tar"
+	"archive/zip"
+	"bytes"
+	"compress/gzip"
 	"context"
 	"os"
 	"path/filepath"
 	"slices"
 	"testing"
 	"testing/fstest"
+
+	"github.com/klauspost/compress/zstd"
 )
 
 type mockRegistry struct {
@@ -315,5 +321,161 @@ func TestSilentUpdatePreservesSelectionsAndRunsUpdateHooks(t *testing.T) {
 	}
 	if reg.removedPath != installDir {
 		t.Errorf("expected RemoveFromUserPath(%q) on uninstall, got %q", installDir, reg.removedPath)
+	}
+}
+
+func TestInstallAndUninstallCompressedPayloads(t *testing.T) {
+	files := map[string][]byte{
+		"towncrier-core.exe": []byte("core-exe-bytes-123456"),
+		"docs/guide.md":      []byte("# TownCrier Guide"),
+		"assets/earcon.wav":  []byte("RIFF-wav-bytes"),
+		"placeholder.txt":    []byte("ignore"),
+	}
+
+	buildTarBytes := func() []byte {
+		var buf bytes.Buffer
+		tw := tar.NewWriter(&buf)
+		for name, data := range files {
+			if err := tw.WriteHeader(&tar.Header{
+				Name:     name,
+				Typeflag: tar.TypeReg,
+				Size:     int64(len(data)),
+				Mode:     0o755,
+			}); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := tw.Write(data); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if err := tw.Close(); err != nil {
+			t.Fatal(err)
+		}
+		return buf.Bytes()
+	}
+
+	makeTarZst := func() []byte {
+		var out bytes.Buffer
+		zw, err := zstd.NewWriter(&out)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := zw.Write(buildTarBytes()); err != nil {
+			t.Fatal(err)
+		}
+		if err := zw.Close(); err != nil {
+			t.Fatal(err)
+		}
+		return out.Bytes()
+	}
+
+	makeTarGz := func() []byte {
+		var out bytes.Buffer
+		gw := gzip.NewWriter(&out)
+		if _, err := gw.Write(buildTarBytes()); err != nil {
+			t.Fatal(err)
+		}
+		if err := gw.Close(); err != nil {
+			t.Fatal(err)
+		}
+		return out.Bytes()
+	}
+
+	makeZip := func() []byte {
+		var out bytes.Buffer
+		zw := zip.NewWriter(&out)
+		for name, data := range files {
+			w, err := zw.Create(name)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := w.Write(data); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if err := zw.Close(); err != nil {
+			t.Fatal(err)
+		}
+		return out.Bytes()
+	}
+
+	cases := []struct {
+		name        string
+		archivePath string
+		data        []byte
+	}{
+		{name: "tar.zst", archivePath: "payload/payload.tar.zst", data: makeTarZst()},
+		{name: "tar.gz", archivePath: "payload/payload.tar.gz", data: makeTarGz()},
+		{name: "zip", archivePath: "payload/payload.zip", data: makeZip()},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			tmpRoot := t.TempDir()
+			installDir := filepath.Join(tmpRoot, "Programs", "TownCrier")
+			shortcutRoot := filepath.Join(tmpRoot, "Shortcuts")
+			selfExe := filepath.Join(tmpRoot, "setup.exe")
+			if err := os.WriteFile(selfExe, []byte("mock-setup"), 0o755); err != nil {
+				t.Fatal(err)
+			}
+
+			reg := &mockRegistry{}
+			ins := NewInstaller(AppSpec{
+				AppName:       "TownCrier",
+				AppID:         "com.github.mrpoundsign.towncrier",
+				Description:   "Local Neural TTS",
+				Publisher:     "mrpoundsign",
+				Version:       "0.2.0",
+				BinaryName:    "TownCrier.exe",
+				PayloadSubdir: "payload",
+				FileRenames: map[string]string{
+					"towncrier-core.exe": "TownCrier.exe",
+				},
+				PayloadFS: fstest.MapFS{
+					tc.archivePath: &fstest.MapFile{Data: tc.data},
+				},
+			})
+			ins.Registry = reg
+			ins.Shortcuts = NoopShortcutManager{BaseDir: shortcutRoot}
+
+			var lastFrac float64 = -1
+			manifest, err := ins.Install(context.Background(), Options{
+				InstallDir:  installDir,
+				SelfExePath: selfExe,
+			}, func(frac float64, _ string) {
+				if frac < lastFrac {
+					t.Fatalf("progress went backwards: %f < %f", frac, lastFrac)
+				}
+				lastFrac = frac
+			})
+			if err != nil {
+				t.Fatalf("Install failed: %v", err)
+			}
+
+			if reg.registered == nil || reg.registered.EstimatedSizeKB < 1 {
+				t.Fatalf("expected EstimatedSizeKB >= 1, got %+v", reg.registered)
+			}
+			for _, rel := range []string{"TownCrier.exe", "docs/guide.md", "assets/earcon.wav"} {
+				if !slices.Contains(manifest.InstalledFiles, rel) {
+					t.Errorf("expected %q in manifest.InstalledFiles, got %v", rel, manifest.InstalledFiles)
+				}
+				if _, err := os.Stat(filepath.Join(installDir, filepath.FromSlash(rel))); err != nil {
+					t.Errorf("expected extracted file %s: %v", rel, err)
+				}
+			}
+			if _, err := os.Stat(filepath.Join(installDir, "placeholder.txt")); !os.IsNotExist(err) {
+				t.Errorf("expected placeholder.txt to be skipped")
+			}
+
+			if err := ins.Uninstall(context.Background(), installDir, false, nil); err != nil {
+				t.Fatalf("Uninstall failed: %v", err)
+			}
+			if _, err := os.Stat(filepath.Join(installDir, "docs")); !os.IsNotExist(err) {
+				t.Errorf("expected empty docs subdir to be removed on uninstall")
+			}
+			if _, err := os.Stat(installDir); !os.IsNotExist(err) {
+				t.Errorf("expected empty installDir to be removed on uninstall")
+			}
+		})
 	}
 }

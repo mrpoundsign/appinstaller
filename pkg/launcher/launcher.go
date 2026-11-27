@@ -1,7 +1,9 @@
 package launcher
 
 import (
+	"context"
 	"crypto/sha256"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -14,7 +16,16 @@ import (
 	"runtime/debug"
 	"strings"
 	"syscall"
+
+	"github.com/mrpoundsign/appinstaller/internal/payloadarchive"
 )
+
+const payloadStampFileName = ".payload-sha256"
+
+type payloadStamp struct {
+	SHA256 string   `json:"sha256"`
+	Files  []string `json:"files"`
+}
 
 // Config defines the configuration for a single-file portable self-extracting launcher.
 type Config struct {
@@ -189,15 +200,38 @@ func CleanupOldPortableBinary(exePath string) {
 }
 
 // ExtractPayloadIfNeeded extracts embedded files from payloadFS/payloadSubdir into targetDir,
-// skipping files whose size and SHA-256 digest already match on disk.
+// using a .payload-sha256 stamp for compressed archives and per-file SHA-256 checks for raw files.
 func ExtractPayloadIfNeeded(payloadFS fs.FS, payloadSubdir, targetDir string) error {
+	if err := os.MkdirAll(targetDir, 0o755); err != nil {
+		return fmt.Errorf("create runtime directory: %w", err)
+	}
+
+	if archivePath, format, ok := payloadarchive.DetectArchive(payloadFS, payloadSubdir); ok {
+		digest, _, err := payloadarchive.HashFile(payloadFS, archivePath)
+		if err != nil {
+			return fmt.Errorf("hash embedded payload archive: %w", err)
+		}
+		if matchesPayloadStamp(targetDir, digest) {
+			return nil
+		}
+		res, err := payloadarchive.Extract(context.Background(), payloadFS, archivePath, format, payloadarchive.ExtractOptions{
+			TargetDir: targetDir,
+		})
+		if err != nil {
+			return fmt.Errorf("extract embedded payload archive: %w", err)
+		}
+		if err := writePayloadStamp(targetDir, payloadStamp{
+			SHA256: digest,
+			Files:  res.Files,
+		}); err != nil {
+			return fmt.Errorf("write payload stamp: %w", err)
+		}
+		return nil
+	}
+
 	entries, err := fs.ReadDir(payloadFS, payloadSubdir)
 	if err != nil {
 		return fmt.Errorf("read embedded payload: %w", err)
-	}
-
-	if err := os.MkdirAll(targetDir, 0755); err != nil {
-		return fmt.Errorf("create runtime directory: %w", err)
 	}
 
 	for _, entry := range entries {
@@ -221,6 +255,49 @@ func ExtractPayloadIfNeeded(payloadFS fs.FS, payloadSubdir, targetDir string) er
 		}
 	}
 
+	return nil
+}
+
+func matchesPayloadStamp(targetDir, expectedSHA256 string) bool {
+	data, err := os.ReadFile(filepath.Join(targetDir, payloadStampFileName))
+	if err != nil {
+		return false
+	}
+	var stamp payloadStamp
+	if err := json.Unmarshal(data, &stamp); err != nil {
+		return false
+	}
+	if stamp.SHA256 != expectedSHA256 || len(stamp.Files) == 0 {
+		return false
+	}
+	for _, rel := range stamp.Files {
+		dstPath, err := payloadarchive.ResolveTargetPath(targetDir, rel)
+		if err != nil {
+			return false
+		}
+		info, err := os.Stat(dstPath)
+		if err != nil || info.IsDir() {
+			return false
+		}
+	}
+	return true
+}
+
+func writePayloadStamp(targetDir string, stamp payloadStamp) error {
+	data, err := json.Marshal(stamp)
+	if err != nil {
+		return err
+	}
+	stampPath := filepath.Join(targetDir, payloadStampFileName)
+	tmpPath := stampPath + ".tmp"
+	if err := os.WriteFile(tmpPath, data, 0o644); err != nil {
+		return err
+	}
+	_ = os.Remove(stampPath)
+	if err := os.Rename(tmpPath, stampPath); err != nil {
+		_ = os.Remove(tmpPath)
+		return err
+	}
 	return nil
 }
 

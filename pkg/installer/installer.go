@@ -14,6 +14,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/mrpoundsign/appinstaller/internal/payloadarchive"
 )
 
 const ManifestFileName = "install-manifest.json"
@@ -283,35 +285,54 @@ func (ins *Installer) Install(ctx context.Context, opts Options, progress func(f
 	var totalBytes int64
 
 	if ins.Spec.PayloadFS != nil {
-		entries, err := collectPayloadFiles(ins.Spec.PayloadFS, ins.Spec.PayloadSubdir)
-		if err != nil {
-			return nil, fmt.Errorf("scan embedded payload: %w", err)
-		}
-
-		for i, relPath := range entries {
-			if err := ctx.Err(); err != nil {
-				return nil, err
+		if archivePath, format, ok := payloadarchive.DetectArchive(ins.Spec.PayloadFS, ins.Spec.PayloadSubdir); ok {
+			res, err := payloadarchive.Extract(ctx, ins.Spec.PayloadFS, archivePath, format, payloadarchive.ExtractOptions{
+				TargetDir:   opts.InstallDir,
+				FileRenames: ins.Spec.FileRenames,
+				OnFileStart: func(dstRel string, bytesRead, totalCompressed int64) {
+					var ratio float64
+					if totalCompressed > 0 {
+						ratio = min(float64(bytesRead)/float64(totalCompressed), 1.0)
+					}
+					report(0.05+0.45*ratio, "Installing "+dstRel+"...")
+				},
+			})
+			if err != nil {
+				return nil, fmt.Errorf("extract payload archive: %w", err)
+			}
+			totalBytes = res.TotalBytes
+			installedFiles = append(installedFiles, res.Files...)
+		} else {
+			entries, err := collectPayloadFiles(ins.Spec.PayloadFS, ins.Spec.PayloadSubdir)
+			if err != nil {
+				return nil, fmt.Errorf("scan embedded payload: %w", err)
 			}
 
-			dstRel := relPath
-			if mapped, ok := ins.Spec.FileRenames[relPath]; ok && mapped != "" {
-				dstRel = mapped
-			} else if mappedBase, ok := ins.Spec.FileRenames[filepath.Base(relPath)]; ok && mappedBase != "" {
-				dstRel = filepath.Join(filepath.Dir(relPath), mappedBase)
+			for i, relPath := range entries {
+				if err := ctx.Err(); err != nil {
+					return nil, err
+				}
+
+				dstRel := relPath
+				if mapped, ok := ins.Spec.FileRenames[relPath]; ok && mapped != "" {
+					dstRel = mapped
+				} else if mappedBase, ok := ins.Spec.FileRenames[filepath.Base(relPath)]; ok && mappedBase != "" {
+					dstRel = filepath.Join(filepath.Dir(relPath), mappedBase)
+				}
+
+				frac := 0.05 + 0.45*(float64(i)/float64(max(len(entries), 1)))
+				report(frac, "Installing "+dstRel+"...")
+
+				embPath := ins.Spec.PayloadSubdir + "/" + relPath
+				dstFull := filepath.Join(opts.InstallDir, filepath.FromSlash(dstRel))
+
+				n, copyErr := extractFileFromFS(ins.Spec.PayloadFS, embPath, dstFull)
+				if copyErr != nil {
+					return nil, fmt.Errorf("install %s: %w", dstRel, copyErr)
+				}
+				totalBytes += n
+				installedFiles = append(installedFiles, filepath.ToSlash(dstRel))
 			}
-
-			frac := 0.05 + 0.45*(float64(i)/float64(max(len(entries), 1)))
-			report(frac, "Installing "+dstRel+"...")
-
-			embPath := ins.Spec.PayloadSubdir + "/" + relPath
-			dstFull := filepath.Join(opts.InstallDir, filepath.FromSlash(dstRel))
-
-			n, copyErr := extractFileFromFS(ins.Spec.PayloadFS, embPath, dstFull)
-			if copyErr != nil {
-				return nil, fmt.Errorf("install %s: %w", dstRel, copyErr)
-			}
-			totalBytes += n
-			installedFiles = append(installedFiles, filepath.ToSlash(dstRel))
 		}
 	}
 
@@ -517,6 +538,7 @@ func (ins *Installer) Uninstall(ctx context.Context, installDir string, purgeUse
 			}
 			target := filepath.Join(installDir, filepath.FromSlash(rel))
 			_ = os.Remove(target)
+			removeEmptyParentDirs(installDir, target)
 		}
 	} else {
 		// Fallback if manifest is missing: remove main binary and known shortcuts
@@ -652,4 +674,17 @@ func copyDiskFile(srcPath, dstPath string) (int64, error) {
 		copyErr = closeErr
 	}
 	return n, copyErr
+}
+
+func removeEmptyParentDirs(installDir, filePath string) {
+	cleanRoot := filepath.Clean(installDir)
+	for dir := filepath.Dir(filepath.Clean(filePath)); dir != cleanRoot && dir != "." && dir != string(filepath.Separator); dir = filepath.Dir(dir) {
+		rel, err := filepath.Rel(cleanRoot, dir)
+		if err != nil || rel == "." || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+			return
+		}
+		if err := os.Remove(dir); err != nil {
+			return
+		}
+	}
 }

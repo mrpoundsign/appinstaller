@@ -4,6 +4,7 @@ go 1.27.1
 
 require (
 	fyne.io/fyne/v2 v2.8.2
+	github.com/klauspost/compress v1.20.5
 	golang.org/x/sys v0.48.0
 )
 
