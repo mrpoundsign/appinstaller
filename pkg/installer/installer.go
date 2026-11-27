@@ -25,7 +25,10 @@ type ComponentSpec struct {
 	Title       string
 	Description string
 	DefaultOn   bool
+	RunOnUpdate bool
+	IsInstalled func(installDir string) bool
 	Run         func(ctx context.Context, installDir string, progress func(cur, total int64, status string)) error
+	Uninstall   func(ctx context.Context, installDir string) error
 }
 
 // AppSpec declaratively describes an application for the unified installer and uninstaller.
@@ -52,21 +55,23 @@ type Options struct {
 	CreateDesktopShortcut   bool
 	AddToUserPath           bool
 	SelectedComponents      map[string]bool
+	PreservedComponents     []string
 	WaitPID                 int
 	SelfExePath             string
 }
 
 // Manifest is persisted as install-manifest.json in the installation directory.
 type Manifest struct {
-	AppName         string    `json:"app_name"`
-	AppID           string    `json:"app_id"`
-	Version         string    `json:"version"`
-	InstallDir      string    `json:"install_dir"`
-	BinaryName      string    `json:"binary_name"`
-	InstalledFiles  []string  `json:"installed_files"`
-	Shortcuts       []string  `json:"shortcuts,omitempty"`
-	AddedToUserPath bool      `json:"added_to_user_path,omitempty"`
-	InstalledAt     time.Time `json:"installed_at"`
+	AppName            string    `json:"app_name"`
+	AppID              string    `json:"app_id"`
+	Version            string    `json:"version"`
+	InstallDir         string    `json:"install_dir"`
+	BinaryName         string    `json:"binary_name"`
+	InstalledFiles     []string  `json:"installed_files"`
+	Shortcuts          []string  `json:"shortcuts,omitempty"`
+	AddedToUserPath    bool      `json:"added_to_user_path,omitempty"`
+	SelectedComponents []string  `json:"selected_components,omitempty"`
+	InstalledAt        time.Time `json:"installed_at"`
 }
 
 // UninstallRegistration holds metadata written to Windows "Installed Apps" (HKCU Uninstall registry).
@@ -196,6 +201,58 @@ func ensureSafePathInTests(targetDir string) error {
 	return nil
 }
 
+// SilentUpdateOptions builds installation options for a silent upgrade based on the previous
+// install-manifest.json and any RunOnUpdate components detected on disk.
+func (ins *Installer) SilentUpdateOptions(installDir string, waitPID int) Options {
+	if strings.TrimSpace(installDir) == "" {
+		installDir = DefaultInstallDir(ins.Spec.AppName)
+	}
+	opts := Options{
+		InstallDir:              installDir,
+		CreateStartMenuShortcut: true,
+		WaitPID:                 waitPID,
+		SelectedComponents:      make(map[string]bool),
+	}
+
+	prev, err := LoadManifest(installDir)
+	if err == nil && prev != nil {
+		opts.AddToUserPath = prev.AddedToUserPath
+		opts.PreservedComponents = slices.Clone(prev.SelectedComponents)
+
+		var dtPath string
+		if ins.Shortcuts != nil {
+			dtPath, _ = ins.Shortcuts.DesktopShortcutPath(ins.Spec.AppName)
+		}
+		for _, sc := range prev.Shortcuts {
+			if strings.TrimSpace(sc) == "" {
+				continue
+			}
+			if dtPath != "" {
+				if strings.EqualFold(filepath.Clean(sc), filepath.Clean(dtPath)) {
+					opts.CreateDesktopShortcut = true
+					break
+				}
+			} else if strings.Contains(strings.ToLower(sc), "desktop") {
+				opts.CreateDesktopShortcut = true
+				break
+			}
+		}
+	}
+
+	for _, comp := range ins.Spec.OptionalComponents {
+		if !comp.RunOnUpdate || comp.Run == nil {
+			continue
+		}
+		wasSelected := prev != nil && slices.Contains(prev.SelectedComponents, comp.ID)
+		detected := comp.IsInstalled != nil && comp.IsInstalled(installDir)
+		if wasSelected || detected {
+			opts.SelectedComponents[comp.ID] = true
+		}
+	}
+
+	return opts
+}
+
 // Install unpacks the embedded payload to opts.InstallDir, writes uninstall.exe and install-manifest.json,
 // creates shortcuts and registry entries, and executes any selected OptionalComponents.
 func (ins *Installer) Install(ctx context.Context, opts Options, progress func(fraction float64, status string)) (*Manifest, error) {
@@ -319,25 +376,24 @@ func (ins *Installer) Install(ctx context.Context, opts Options, progress func(f
 		}
 	}
 
+	recordedComponents := dedupeSortedStrings(opts.PreservedComponents)
+
 	manifest := &Manifest{
-		AppName:         ins.Spec.AppName,
-		AppID:           ins.Spec.AppID,
-		Version:         ins.Spec.Version,
-		InstallDir:      opts.InstallDir,
-		BinaryName:      ins.Spec.BinaryName,
-		InstalledFiles:  installedFiles,
-		Shortcuts:       createdShortcuts,
-		AddedToUserPath: opts.AddToUserPath,
-		InstalledAt:     time.Now().UTC(),
+		AppName:            ins.Spec.AppName,
+		AppID:              ins.Spec.AppID,
+		Version:            ins.Spec.Version,
+		InstallDir:         opts.InstallDir,
+		BinaryName:         ins.Spec.BinaryName,
+		InstalledFiles:     installedFiles,
+		Shortcuts:          createdShortcuts,
+		AddedToUserPath:    opts.AddToUserPath,
+		SelectedComponents: recordedComponents,
+		InstalledAt:        time.Now().UTC(),
 	}
 
-	manifestBytes, err := json.MarshalIndent(manifest, "", "  ")
-	if err != nil {
-		return nil, fmt.Errorf("marshal install manifest: %w", err)
-	}
 	manifestPath := filepath.Join(opts.InstallDir, ManifestFileName)
-	if err := os.WriteFile(manifestPath, manifestBytes, 0644); err != nil {
-		return nil, fmt.Errorf("write install manifest: %w", err)
+	if err := writeManifestFile(manifestPath, manifest); err != nil {
+		return nil, err
 	}
 
 	// Execute any selected OptionalComponents (e.g. TTS model pre-downloads, Inkscape extensions)
@@ -366,10 +422,46 @@ func (ins *Installer) Install(ctx context.Context, opts Options, progress func(f
 		if err != nil {
 			return manifest, fmt.Errorf("component %q failed: %w", comp.Title, err)
 		}
+		recordedComponents = append(recordedComponents, comp.ID)
+	}
+
+	if len(activeComponents) > 0 {
+		manifest.SelectedComponents = dedupeSortedStrings(recordedComponents)
+		if err := writeManifestFile(manifestPath, manifest); err != nil {
+			return manifest, err
+		}
 	}
 
 	report(1.0, "Installation complete!")
 	return manifest, nil
+}
+
+func writeManifestFile(manifestPath string, manifest *Manifest) error {
+	manifestBytes, err := json.MarshalIndent(manifest, "", "  ")
+	if err != nil {
+		return fmt.Errorf("marshal install manifest: %w", err)
+	}
+	if err := os.WriteFile(manifestPath, manifestBytes, 0644); err != nil {
+		return fmt.Errorf("write install manifest: %w", err)
+	}
+	return nil
+}
+
+func dedupeSortedStrings(items []string) []string {
+	if len(items) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(items))
+	for _, s := range items {
+		if trimmed := strings.TrimSpace(s); trimmed != "" {
+			out = append(out, trimmed)
+		}
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	slices.Sort(out)
+	return slices.Compact(out)
 }
 
 // LoadManifest reads install-manifest.json from the given installation directory.
@@ -438,6 +530,17 @@ func (ins *Installer) Uninstall(ctx context.Context, installDir string, purgeUse
 		}
 		if ins.Spec.BinaryName != "" {
 			_ = os.Remove(filepath.Join(installDir, ins.Spec.BinaryName))
+		}
+	}
+
+	for _, comp := range ins.Spec.OptionalComponents {
+		if comp.Uninstall == nil {
+			continue
+		}
+		wasSelected := manifest != nil && slices.Contains(manifest.SelectedComponents, comp.ID)
+		detected := comp.IsInstalled != nil && comp.IsInstalled(installDir)
+		if wasSelected || detected {
+			_ = comp.Uninstall(ctx, installDir)
 		}
 	}
 

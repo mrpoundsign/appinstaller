@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 
 	"fyne.io/fyne/v2"
@@ -63,12 +64,7 @@ func RunMain(spec installer.AppSpec, appIcon fyne.Resource) int {
 			return 0
 		}
 
-		opts := installer.Options{
-			InstallDir:              targetDir,
-			CreateStartMenuShortcut: true,
-			CreateDesktopShortcut:   false,
-			WaitPID:                 *waitPIDFlag,
-		}
+		opts := ins.SilentUpdateOptions(targetDir, *waitPIDFlag)
 		_, err := ins.Install(ctx, opts, nil)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "%s silent install error: %v\n", spec.AppName, err)
@@ -102,6 +98,7 @@ func RunMain(spec installer.AppSpec, appIcon fyne.Resource) int {
 func showInstallWindow(a fyne.App, ins *installer.Installer, initialDir string, waitPID int) {
 	spec := ins.Spec
 	ver := strings.TrimPrefix(spec.Version, "v")
+	prevManifest, _ := installer.LoadManifest(initialDir)
 	w := a.NewWindow(fmt.Sprintf("%s v%s — Setup", spec.AppName, ver))
 	w.Resize(fyne.NewSize(620, 480))
 	w.CenterOnScreen()
@@ -149,7 +146,10 @@ func showInstallWindow(a fyne.App, ins *installer.Installer, initialDir string, 
 		optionsBox.Add(widget.NewLabelWithStyle("Optional Components & Downloads:", fyne.TextAlignLeading, fyne.TextStyle{Bold: true}))
 		for _, comp := range spec.OptionalComponents {
 			c := comp
-			selectedComps[c.ID] = c.DefaultOn
+			initialChecked := c.DefaultOn ||
+				(c.RunOnUpdate && prevManifest != nil && slices.Contains(prevManifest.SelectedComponents, c.ID)) ||
+				(c.RunOnUpdate && c.IsInstalled != nil && c.IsInstalled(initialDir))
+			selectedComps[c.ID] = initialChecked
 			label := c.Title
 			if c.Description != "" {
 				label += " — " + c.Description
@@ -157,7 +157,7 @@ func showInstallWindow(a fyne.App, ins *installer.Installer, initialDir string, 
 			chk := widget.NewCheck(label, func(checked bool) {
 				selectedComps[c.ID] = checked
 			})
-			chk.SetChecked(c.DefaultOn)
+			chk.SetChecked(initialChecked)
 			compChecks = append(compChecks, chk)
 			optionsBox.Add(chk)
 		}
@@ -200,6 +200,7 @@ func showInstallWindow(a fyne.App, ins *installer.Installer, initialDir string, 
 			InstallDir:              targetDir,
 			CreateStartMenuShortcut: startMenuCheck.Checked,
 			CreateDesktopShortcut:   desktopCheck.Checked,
+			AddToUserPath:           prevManifest != nil && prevManifest.AddedToUserPath,
 			SelectedComponents:      selectedComps,
 			WaitPID:                 waitPID,
 		}

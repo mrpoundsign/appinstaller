@@ -1,0 +1,10 @@
+# Treat all files as text and force LF line endings on checkout
+* text=auto eol=lf
+
+# Explicitly ensure binary files are not modified
+*.png binary
+*.jpg binary
+*.ico binary
+*.exe binary
+*.wav binary
+*.onnx binary

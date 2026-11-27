@@ -1,0 +1,60 @@
+name: CI Quality Gate
+
+on:
+  push:
+    branches:
+      - main
+      - dev
+  pull_request:
+    branches:
+      - main
+      - dev
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  quality-gate:
+    name: Lint & Test Suite (Quality Gate)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.27'
+          cache: true
+
+      - name: Install Linux GUI Dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq \
+            libgl1-mesa-dev xorg-dev libxcursor-dev libxrandr-dev \
+            libxinerama-dev libxi-dev libxxf86vm-dev libwayland-dev \
+            libxkbcommon-dev
+
+      - name: Run go fix -diff
+        run: |
+          DIFF="$(go fix -diff ./...)"
+          if [ -n "$DIFF" ]; then
+            echo "$DIFF"
+            exit 1
+          fi
+
+      - name: Run go vet
+        run: go vet ./...
+
+      - name: Run golangci-lint (v2)
+        uses: golangci/golangci-lint-action@v9
+        with:
+          version: v2.14.0
+
+      - name: Run Full Test Suite
+        run: go test -race -count=1 ./...
